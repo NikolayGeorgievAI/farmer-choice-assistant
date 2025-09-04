@@ -31,12 +31,21 @@ def load_csv_robust(path: Path) -> pd.DataFrame:
         st.error(f"Could not parse CSV. Last error: {e or last_err}")
         st.stop()
 
-# ---------- Load & normalize data ----------
+# --- Load data (strict comma CSV) ---
 DATA_PATH = Path("data/barley_scenarios.csv")
-df = load_csv_robust(DATA_PATH)
 
-# Normalize headers (lowercase, trimmed)
+# Read as plain UTF-8 CSV with comma delimiter
+df = pd.read_csv(
+    DATA_PATH,
+    sep=",",            # force comma
+    engine="c",         # fast/strict parser
+    encoding="utf-8",   # Excel usually saves fine with this
+    skip_blank_lines=True
+)
+
+# Normalize headers
 df.columns = [c.strip().lower() for c in df.columns]
+
 
 # Debug (visible in the app; remove later if you want)
 with st.expander("Debug: data preview", expanded=False):
@@ -148,3 +157,4 @@ if not top.empty:
 
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
+
