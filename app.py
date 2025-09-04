@@ -5,16 +5,43 @@ from pathlib import Path
 
 st.set_page_config(page_title="Farmer Choice Assistant (Demo)", page_icon="🌾", layout="centered")
 
-# --- Load data ---
+# ---------- Robust CSV loader ----------
+def load_csv_robust(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        st.error(f"Data file not found at: {path}. Make sure you have data/barley_scenarios.csv in the repo.")
+        st.stop()
+
+    # Try common separators first (comma/semicolon/tab/pipe), then fallback to autodetect
+    seps = [",", ";", "\t", "|"]
+    last_err = None
+    for sep in seps:
+        try:
+            df_try = pd.read_csv(path, sep=sep, encoding="utf-8-sig")
+            # Require at least several columns to consider it valid
+            if df_try.shape[1] >= 5:
+                return df_try
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Fallback: python engine autodetect, skip bad lines rather than crash
+    try:
+        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", on_bad_lines="skip")
+    except Exception as e:
+        st.error(f"Could not parse CSV. Last error: {e or last_err}")
+        st.stop()
+
+# ---------- Load & normalize data ----------
 DATA_PATH = Path("data/barley_scenarios.csv")
+df = load_csv_robust(DATA_PATH)
 
-# Handle BOM, auto-separators, normalize headers
-df = pd.read_csv(DATA_PATH, sep=None, engine="python", encoding="utf-8-sig")
-df.columns = [c.strip().lower() for c in df.columns]  # normalize headers
+# Normalize headers (lowercase, trimmed)
+df.columns = [c.strip().lower() for c in df.columns]
 
-# Debug info (you can remove later)
-st.write("Columns loaded:", list(df.columns))
-st.dataframe(df.head())
+# Debug (visible in the app; remove later if you want)
+with st.expander("Debug: data preview", expanded=False):
+    st.write("Columns loaded:", list(df.columns))
+    st.dataframe(df.head())
 
 # Validate required columns
 required = ["region","crop","variety","type","maturity",
@@ -29,9 +56,8 @@ if missing:
 for c in ["region","crop","variety","type","maturity","program_n","program_cp"]:
     df[c] = df[c].astype(str).str.strip()
 
-# --- Sidebar / Inputs ---
+# ---------- UI ----------
 st.title("🌾 Malting Barley (Demo)")
-
 st.markdown(
     "This demo shows how AI-style decision support can simplify complex choices. "
     "It **does not replace** agronomists or farmer expertise — it provides quick, neutral baseline options."
@@ -47,55 +73,52 @@ risk_tolerance = st.slider("Risk tolerance (0=low, 1=high)", 0.0, 1.0, 0.3, 0.1)
 
 st.divider()
 
-# --- Filter by region ---
+# ---------- Filter ----------
 d = df[df["region"] == region].copy()
 if d.empty:
     st.warning("No data for this region.")
     st.stop()
 
-# --- Scoring logic ---
+# ---------- Scoring logic ----------
 def minmax(x):
     return (x - x.min()) / (x.max() - x.min() + 1e-9)
 
 d["yield_norm"] = minmax(d["yield_t_ha"])
-d["cost_norm"] = 1 - minmax(d["cost_eur_ha"])          # lower cost = higher score
+d["cost_norm"] = 1 - minmax(d["cost_eur_ha"])  # lower cost = higher score
 
 protein_target = 11.5
-d["protein_score"] = np.where(d["protein_pct"] <= protein_target,
-                              1 - (d["protein_pct"] / protein_target)*0.3,
-                              np.maximum(0, 1 - (d["protein_pct"] - protein_target)*0.5))
-d["protein_score"] = d["protein_score"].clip(0,1)
+d["protein_score"] = np.where(
+    d["protein_pct"] <= protein_target,
+    1 - (d["protein_pct"] / protein_target) * 0.3,
+    np.maximum(0, 1 - (d["protein_pct"] - protein_target) * 0.5),
+).clip(0, 1)
 
-# Base weights
-w = {"yield": 0.33, "malting": 0.27, "cost": 0.20, "sustain": 0.20}
-
+weights = {"yield": 0.33, "malting": 0.27, "cost": 0.20, "sustain": 0.20}
 if priority == "Maximize yield":
-    w["yield"] += 0.20; w["cost"] -= 0.10; w["sustain"] -= 0.10
+    weights["yield"] += 0.20; weights["cost"] -= 0.10; weights["sustain"] -= 0.10
 elif priority == "Meet malting specs":
-    w["malting"] += 0.20; w["yield"] -= 0.10; w["cost"] -= 0.10
+    weights["malting"] += 0.20; weights["yield"] -= 0.10; weights["cost"] -= 0.10
 elif priority == "Lower cost":
-    w["cost"] += 0.20; w["yield"] -= 0.10; w["sustain"] -= 0.10
+    weights["cost"] += 0.20; weights["yield"] -= 0.10; weights["sustain"] -= 0.10
 elif priority == "Higher sustainability":
-    w["sustain"] += 0.20; w["yield"] -= 0.10; w["cost"] -= 0.10
+    weights["sustain"] += 0.20; weights["yield"] -= 0.10; weights["cost"] -= 0.10
+wsum = sum(max(0, v) for v in weights.values())
+weights = {k: max(0, v) / wsum for k, v in weights.items()}
 
-wsum = sum(w.values())
-for k in w:
-    w[k] = max(0, w[k]) / wsum
-
-cp_penalty = d["program_cp"].str.contains("Intensive").astype(int) * (1 - risk_tolerance) * 0.15
+cp_penalty = d["program_cp"].str.contains("Intensive", case=False).astype(int) * (1 - risk_tolerance) * 0.15
 protein_penalty = np.where(d["protein_pct"] > protein_target, (1 - risk_tolerance) * 0.20, 0.0)
 
 d["score"] = (
-    w["yield"] * d["yield_norm"] +
-    w["malting"] * d["protein_score"] +
-    w["cost"] * d["cost_norm"] +
-    w["sustain"] * d["sustain_score"]
-    - cp_penalty - protein_penalty
+    weights["yield"] * d["yield_norm"] +
+    weights["malting"] * d["protein_score"] +
+    weights["cost"] * d["cost_norm"] +
+    weights["sustain"] * d["sustain_score"] -
+    cp_penalty - protein_penalty
 )
 
 top = d.sort_values("score", ascending=False).head(3).reset_index(drop=True)
 
-# --- Show recommendations ---
+# ---------- Output ----------
 st.subheader(f"Top recommendations for **{region}** ({priority}, risk tolerance {risk_tolerance:.1f})")
 
 for i, row in top.iterrows():
@@ -113,17 +136,15 @@ for i, row in top.iterrows():
 
 st.caption("Demo only: values are simplified and illustrative. Use alongside agronomist advice, farm records, and local regulations.")
 
-# --- Explanation ---
 if not top.empty:
     best = top.iloc[0]
-    rationale = (
+    st.info(
         f"**Why Option 1?** It balances malting quality (protein ~{best['protein_pct']:.1f}%) "
         f"with solid yield ({best['yield_t_ha']:.1f} t/ha) and a {best['program_n'].lower()} / "
         f"{best['program_cp'].lower()} program. Cost ≈ €{best['cost_eur_ha']:.0f}/ha "
         f"and sustainability score {best['sustain_score']:.2f}. "
         f"If malt acceptance is critical, options with protein above 11.5% are riskier despite higher yields."
     )
-    st.info(rationale)
 
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
