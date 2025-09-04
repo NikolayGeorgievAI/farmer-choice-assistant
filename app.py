@@ -67,7 +67,7 @@ st.markdown(
     "It **does not replace** agronomists or farmer expertise — it provides quick, neutral baseline options."
 )
 
-region = st.selectbox("Region", sorted(df["region"].unique().tolist()))
+region = st.selectbox("Region", sorted(df["region"].unique()), index=0, placeholder="Select a region")
 priority = st.radio(
     "Your priority",
     ["Balanced", "Maximize yield", "Meet malting specs", "Lower cost", "Higher sustainability"],
@@ -152,5 +152,6 @@ if not top.empty:
 
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
+
 
 
