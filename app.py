@@ -149,7 +149,7 @@ d["revenue_eur_ha"] = d["yield_t_ha"] * d["price_eur_t"]
 d["profit_eur_ha"]  = d["revenue_eur_ha"] - d["cost_adj_eur_ha"]
 d["profit_norm"]    = minmax(d["profit_eur_ha"])
 
-# Quality score (baked in)
+# Quality score (baked in for "Balanced" ranking)
 def quality_score(p):
     if low_ok <= p <= high_ok: return 1.0
     if 9.5 <= p < low_ok or high_ok < p <= 12.0: return 0.6
@@ -172,42 +172,37 @@ p_bonus_flags = d["p_program"].str.contains("starter p", case=False) | d["p_prog
 d["extract_bonus"]   = np.where(p_bonus_flags, 0.05, 0.0)
 d["extract_penalty"] = np.where(d["late_n"] == 1, 0.10 * (1 - risk_tolerance), 0.0)
 
-# ========== Scoring (more profit-sensitive) ==========
-# Strong base weight on profit; quality next
-w = {"profit": 0.46, "quality": 0.22, "yield": 0.16, "sustain": 0.10, "extract": 0.06}
-
-if priority == "Maximize profit":
-    w["profit"] += 0.24; w["yield"] -= 0.10; w["sustain"] -= 0.08; w["extract"] -= 0.06
-elif priority == "Maximize yield":
-    w["yield"]  += 0.24; w["profit"] -= 0.12; w["sustain"] -= 0.06; w["extract"] -= 0.06
-elif priority == "Higher sustainability":
-    w["sustain"] += 0.24; w["profit"] -= 0.12; w["yield"]  -= 0.06; w["extract"] -= 0.06
-elif priority == "Lower cost":
-    # cost flows through profit; tilt toward sustain + quality
-    w["sustain"] += 0.12; w["quality"] += 0.06; w["profit"] -= 0.12; w["yield"] -= 0.06
-elif priority == "Maximize extract (starch) within N 1.6–1.75%":
-    w["extract"] += 0.26; w["yield"] += 0.06; w["profit"] -= 0.18; w["sustain"] -= 0.14
-
-# Normalize
-wsum = sum(max(0, v) for v in w.values())
-w = {k: max(0, v) / wsum for k, v in w.items()}
-
-# Base score
+# Composite score (used only for Balanced + tie-breaks)
+w_balanced = {"profit": 0.40, "quality": 0.25, "yield": 0.20, "sustain": 0.10, "extract": 0.05}
+wsum = sum(w_balanced.values())
+w_balanced = {k: v/wsum for k, v in w_balanced.items()}
 d["score"] = (
-    w["profit"]  * d["profit_norm"]   +
-    w["quality"] * d["quality_score"] +
-    w["yield"]   * d["yield_norm"]    +
-    w["sustain"] * d["sustain_score"] +
-    w["extract"] * d["extract_norm"]
+    w_balanced["profit"]  * d["profit_norm"]   +
+    w_balanced["quality"] * d["quality_score"] +
+    w_balanced["yield"]   * d["yield_norm"]    +
+    w_balanced["sustain"] * d["sustain_score"] +
+    w_balanced["extract"] * d["extract_norm"]
     - hard_penalty
 )
 
-# Apply extract-specific nudges only under that priority
-if priority == "Maximize extract (starch) within N 1.6–1.75%":
-    d["score"] = d["score"] + d["extract_bonus"] - d["extract_penalty"]
+# -------- Priority-driven ranking (CLEAR reordering) --------
+if priority == "Maximize profit":
+    d["_pri_key"] = d["profit_eur_ha"];     asc = [False]
+elif priority == "Maximize yield":
+    d["_pri_key"] = d["yield_t_ha"];        asc = [False]
+elif priority == "Lower cost":
+    d["_pri_key"] = d["cost_adj_eur_ha"];   asc = [True]
+elif priority == "Higher sustainability":
+    d["_pri_key"] = d["sustain_score"];     asc = [False]
+elif priority.startswith("Maximize extract"):
+    d["_pri_key"] = d["extract_norm"] + d["extract_bonus"] - d["extract_penalty"]; asc = [False]
+else:  # Balanced
+    d["_pri_key"] = d["score"];             asc = [False]
 
-# Rank
-top = d.sort_values("score", ascending=False).head(3).reset_index(drop=True)
+# Tie-breakers: then by composite score, then by profit
+sort_cols = ["_pri_key", "score", "profit_eur_ha"]
+asc += [False, False]
+top = d.sort_values(sort_cols, ascending=asc).head(3).reset_index(drop=True)
 
 # ========== Output ==========
 st.subheader(f"Top recommendations for **{region}** ({priority})")
@@ -239,30 +234,23 @@ if not top.empty:
     if priority == "Maximize profit":
         why = (f"**Why Option 1?** Highest margin at ~€{best['profit_eur_ha']:.0f}/ha, driven by "
                f"{best['yield_t_ha']:.1f} t/ha yield and malting acceptance (protein {best['protein_pct']:.1f}%). "
-               f"Even with urea at ~{urea_price} USD/t, costs remain competitive. If you prefer lower input intensity, "
-               f"Option 2 trades a bit of profit for lower cost and higher sustainability.")
+               f"Even with urea ~{urea_price} USD/t, costs stay competitive. Option 2 trades a little margin for a different risk profile.")
     elif priority == "Maximize yield":
         why = (f"**Why Option 1?** Top yield at {best['yield_t_ha']:.1f} t/ha while staying within/near malting spec "
-               f"(protein {best['protein_pct']:.1f}%). Profit remains strong but costs are higher. If you want a safer "
-               f"protein buffer, Option 2 is a good trade-off.")
+               f"(protein {best['protein_pct']:.1f}%). If you want a safer protein buffer, Option 2 is a good trade-off.")
     elif priority == "Higher sustainability":
-        why = (f"**Why Option 1?** Best sustainability score in the set with a leaner N program and standard CP. "
-               f"Protein {best['protein_pct']:.1f}% stays in the malting band; profit roughly €{best['profit_eur_ha']:.0f}/ha. "
-               f"If you want more margin, Option 2 sacrifices some sustainability for higher yield.")
+        why = (f"**Why Option 1?** Best sustainability score with a leaner N program and standard CP. "
+               f"Protein {best['protein_pct']:.1f}% remains in the malting band; profit ≈€{best['profit_eur_ha']:.0f}/ha.")
     elif priority == "Lower cost":
-        why = (f"**Why Option 1?** Lowest adjusted cost per hectare (urea-linked) while keeping malting acceptance "
-               f"(protein {best['protein_pct']:.1f}%). Profit is competitive and input risk is contained. "
-               f"For higher revenue potential, Option 2 adds inputs and yield.")
-    else:  # Extract priority or Balanced
-        if priority.startswith("Maximize extract"):
-            why = (f"**Why Option 1?** Grain N ~{best['grain_n_pct']:.2f}% (protein {best['protein_pct']:.1f}%) sits near "
-                   f"the 1.6–1.75% N sweet spot for extract. Yield {best['yield_t_ha']:.1f} t/ha is strong; "
-                   f"{'no late N' if best['late_n']==0 else 'late N present'} and P program **{best['p_program']}** support early vigor. "
-                   f"If you’ll accept slightly higher protein for more yield, Option 2 might edge it.")
-        else:
-            why = (f"**Why Option 1?** Best overall balance of margin (≈€{best['profit_eur_ha']:.0f}/ha), "
-                   f"malting acceptance (protein {best['protein_pct']:.1f}%), and operational risk. "
-                   f"If you prioritize sustainability or maximum yield, Options 2–3 offer targeted trade-offs.")
+        why = (f"**Why Option 1?** Lowest adjusted cost/ha (urea-linked) while keeping malting acceptance "
+               f"(protein {best['protein_pct']:.1f}%). Profit stays competitive; inputs and risk are contained.")
+    elif priority.startswith("Maximize extract"):
+        why = (f"**Why Option 1?** Grain N ~{best['grain_n_pct']:.2f}% (protein {best['protein_pct']:.1f}%) near "
+               f"the 1.6–1.75% target for extract, with strong yield ({best['yield_t_ha']:.1f} t/ha). "
+               f"{'No late N' if best['late_n']==0 else 'Late N present'}; P program **{best['p_program']}** supports early vigor.")
+    else:
+        why = (f"**Why Option 1?** Best balance of margin (≈€{best['profit_eur_ha']:.0f}/ha), malting acceptance "
+               f"(protein {best['protein_pct']:.1f}%), and operational risk.")
     st.info(why)
 
 # Footers
