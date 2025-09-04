@@ -7,7 +7,24 @@ st.set_page_config(page_title="Farmer Choice Assistant (Demo)", page_icon="🌾"
 
 # --- Load data ---
 DATA_PATH = Path("data/barley_scenarios.csv")
-df = pd.read_csv(DATA_PATH)
+
+# Be tolerant to separators/encoding and normalize column names
+df = pd.read_csv(DATA_PATH, sep=None, engine="python")  # auto-detect comma/semicolon
+df.columns = [c.strip().lower() for c in df.columns]    # e.g. "Region " -> "region"
+
+# Validate required columns
+required = ["region","crop","variety","type","maturity",
+            "program_n","program_cp","yield_t_ha","cost_eur_ha",
+            "protein_pct","sustain_score"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error(f"CSV is missing required columns: {missing}\nFound columns: {list(df.columns)}")
+    st.stop()
+
+# Clean string fields
+for c in ["region","crop","variety","type","maturity","program_n","program_cp"]:
+    df[c] = df[c].astype(str).str.strip()
+
 
 # --- Sidebar / Inputs ---
 st.title("🌾 Farmer Choice Assistant — Malting Barley (Demo)")
@@ -121,3 +138,4 @@ if not top.empty:
 # --- Footer ---
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-like logic can simplify farmer choices.")
+
