@@ -47,11 +47,6 @@ df = pd.read_csv(
 df.columns = [c.strip().lower() for c in df.columns]
 
 
-# Debug (visible in the app; remove later if you want)
-with st.expander("Debug: data preview", expanded=False):
-    st.write("Columns loaded:", list(df.columns))
-    st.dataframe(df.head())
-
 # Validate required columns
 required = ["region","crop","variety","type","maturity",
             "program_n","program_cp","yield_t_ha","cost_eur_ha",
@@ -157,4 +152,5 @@ if not top.empty:
 
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
+
 
