@@ -5,18 +5,61 @@ from pathlib import Path
 
 st.set_page_config(page_title="Farmer Choice Assistant (Demo)", page_icon="🌾", layout="centered")
 
-# ---------- Load data (strict comma CSV) ----------
+# ========== External price fetchers (cached) ==========
+
+@st.cache_data(ttl=24*3600)
+def fetch_barley_price_usd_t() -> float | None:
+    """
+    Global price of Barley (USD/mt) proxy from FRED (PBARLUSDM).
+    Returns latest monthly value as float, or None on failure.
+    """
+    try:
+        fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=PBARLUSDM"
+        df = pd.read_csv(fred_url)
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+        df = df.dropna(subset=["DATE"])
+        df = df.sort_values("DATE")
+        val = df.iloc[-1]["PBARLUSDM"]
+        return float(val) if pd.notnull(val) else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=24*3600)
+def fetch_urea_price_usd_t() -> float | None:
+    """
+    Urea (bulk, Middle East) monthly price from World Bank CMO workbook.
+    Requires an Excel reader (openpyxl). Falls back to None if not available.
+    """
+    try:
+        wb_url = ("https://thedocs.worldbank.org/en/doc/"
+                  "5d903e848db1d1b83e0ec8f744e55570-0350012021/related/CMO-Historical-Data-Monthly.xlsx")
+        # Many Streamlit environments support openpyxl; if not, this will raise and we'll return None.
+        raw = pd.read_excel(wb_url, sheet_name="Monthly Prices", header=4, engine="openpyxl")
+        # Find the urea column
+        urea_cols = [c for c in raw.columns if isinstance(c, str) and "Urea" in c]
+        if not urea_cols:
+            return None
+        ucol = urea_cols[0]
+        df = raw[["Date", ucol]].dropna()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date")
+        val = df.iloc[-1][ucol]
+        return float(val) if pd.notnull(val) else None
+    except Exception:
+        return None
+
+# ========== Data load (your local CSV) ==========
 DATA_PATH = Path("data/barley_scenarios.csv")
 df = pd.read_csv(
     DATA_PATH,
-    sep=",",            # force comma
+    sep=",",
     engine="c",
     encoding="utf-8",
     skip_blank_lines=True
 )
 df.columns = [c.strip().lower() for c in df.columns]
 
-# ---------- UI ----------
+# ========== UI ==========
 st.title("🌾 Malting Barley (Demo)")
 st.markdown(
     "This demo shows how AI-style decision support can simplify complex choices. "
@@ -33,36 +76,55 @@ priority = st.radio(
     index=0
 )
 
-# Risk tolerance for aggressive programs (currently used to soften hard penalties if needed later)
+# Risk tolerance (kept for potential penalties)
 risk_tolerance = st.slider("Risk tolerance (0=low, 1=high)", 0.0, 1.0, 0.3, 0.1)
 
-# Market assumptions
+# Try to fetch external prices
+barley_proxy = fetch_barley_price_usd_t()
+urea_proxy   = fetch_urea_price_usd_t()
+
+# Defaults (rounded) with graceful fallbacks
+base_price_default  = int(round(barley_proxy, 0)) if barley_proxy else 180
+urea_price_default  = int(round(urea_proxy, 0))   if urea_proxy   else 400
+
 st.subheader("Market assumptions")
-colp1, colp2, colp3 = st.columns(3)
+colp1, colp2, colp3, colp4 = st.columns(4)
 with colp1:
-    base_price = st.number_input("Base barley price (€/t)", min_value=50, max_value=500, value=180, step=5)
+    base_price = st.number_input("Base barley price (€/t)", min_value=50, max_value=500, value=base_price_default, step=5)
 with colp2:
     malting_premium = st.number_input("Malting premium (€/t)", min_value=0, max_value=200, value=25, step=5)
 with colp3:
     oos_discount = st.number_input("Out-of-spec discount (€/t)", min_value=0, max_value=200, value=20, step=5)
+with colp4:
+    urea_price = st.number_input("Urea price (USD/t, proxy)", min_value=100, max_value=1200, value=urea_price_default, step=10)
+
+with st.expander("Price sources (proxies)", expanded=False):
+    st.caption(
+        "Barley price: FRED global barley price (PBARLUSDM), monthly proxy. "
+        "Malting-specific spot varies by region/spec; adjust the malting premium accordingly."
+    )
+    st.caption(
+        "Urea price: World Bank CMO 'Urea (bulk, Middle East)', monthly proxy. "
+        "Used here for context only."
+    )
 
 st.divider()
 
-# ---------- Filter by region ----------
+# ========== Filter by region ==========
 d = df[df["region"] == region].copy()
 if d.empty:
     st.warning("No data for this region.")
     st.stop()
 
-# ---------- Helper ----------
+# ========== Helpers ==========
 def minmax(x):
     return (x - x.min()) / (x.max() - x.min() + 1e-9)
 
-# ---------- Normalize basic metrics ----------
+# Normalize basic metrics
 d["yield_norm"] = minmax(d["yield_t_ha"])
 d["cost_norm"]  = 1 - minmax(d["cost_eur_ha"])  # lower cost = higher score
 
-# ---------- Malting spec + economics ----------
+# ========== Malting spec + economics ==========
 # Protein target band for malting acceptance
 low_ok, high_ok = 10.0, 11.5  # %
 def quality_band(p):
@@ -104,7 +166,7 @@ d["quality_score"] = d["protein_pct"].apply(quality_score)
 # Extra hard penalty well outside spec (protect the farmer)
 hard_penalty = np.where((d["protein_pct"] < 9.5) | (d["protein_pct"] > 12.0), 0.25 * (1 - risk_tolerance), 0.0)
 
-# ---------- Scoring ----------
+# ========== Scoring ==========
 # Base weights (profit + quality lead; yield & sustainability follow)
 w = {"profit": 0.34, "quality": 0.26, "yield": 0.22, "sustain": 0.18}
 
@@ -131,7 +193,7 @@ d["score"] = (
     - hard_penalty
 )
 
-# ---------- Rank & Output ----------
+# ========== Rank & Output ==========
 top = d.sort_values("score", ascending=False).head(3).reset_index(drop=True)
 
 st.subheader(f"Top recommendations for **{region}** ({priority}, risk tolerance {risk_tolerance:.1f})")
@@ -160,7 +222,10 @@ st.caption(
     "Sustainability score (0–1) is a simple proxy from the N and crop protection intensity of each program "
     "(higher = lower expected footprint). This is illustrative — a real system would link to proper LCA/footprint models."
 )
-st.caption("Demo only: values are simplified and illustrative. Use alongside agronomist advice, farm records, and local regulations.")
+st.caption(
+    "Prices are monthly proxies (FRED barley; World Bank urea) used for defaults only. "
+    "Actual local/malting spot may differ; adjust premiums/discounts as needed."
+)
 
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
