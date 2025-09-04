@@ -69,7 +69,6 @@ priority = st.radio(
     ],
     index=0
 )
-
 risk_tolerance = st.slider("Risk tolerance (0=low, 1=high)", 0.0, 1.0, 0.3, 0.1)
 
 # Market defaults via proxies (graceful fallbacks)
@@ -79,7 +78,7 @@ base_price_default  = int(round(barley_proxy, 0)) if barley_proxy else 180
 urea_price_default  = int(round(urea_proxy, 0))   if urea_proxy   else 400
 
 st.subheader("Market assumptions")
-colp1, colp2, colp3, colp4 = st.columns(4)
+colp1, colp2, colp3, colp4, colp5 = st.columns(5)
 with colp1:
     base_price = st.number_input("Base barley price (€/t)", min_value=50, max_value=500, value=base_price_default, step=5)
 with colp2:
@@ -88,6 +87,15 @@ with colp3:
     oos_discount = st.number_input("Out-of-spec discount (€/t)", min_value=0, max_value=200, value=20, step=5)
 with colp4:
     urea_price = st.number_input("Urea price (USD/t, proxy)", min_value=100, max_value=1200, value=urea_price_default, step=10)
+with colp5:
+    p_price = st.number_input("P product price (€/t)", min_value=200, max_value=1500, value=900, step=25)
+
+st.subheader("Agronomy levers")
+colt1, colt2 = st.columns(2)
+with colt1:
+    use_n_inhib = st.checkbox("Use N inhibitor (↓20% N, +€20/t urea, −0.1 pp protein)")
+with colt2:
+    use_p_prot  = st.checkbox("Use P protector (+0.15 t/ha with Starter/adequate P, +€20/t P, +€4/t premium)")
 
 with st.expander("Price sources (proxies)", expanded=False):
     st.caption("Barley: FRED global barley price (PBARLUSDM), monthly proxy. Adjust malting premium for region/spec.")
@@ -114,68 +122,97 @@ def extract_n_rate(s: str) -> float:
     m = re.search(r"(\d+)\s*kg\s*N", s)
     return float(m.group(1)) if m else 0.0
 
+# Crude P rate per program for demo (kg/ha of P-product)
+def estimate_p_rate(program: str) -> float:
+    prog = (program or "").lower()
+    if "starter" in prog:        return 25.0
+    if "adequate" in prog:       return 10.0
+    return 0.0  # no starter
+
 d["n_rate_kg_ha"] = d["program_n"].map(extract_n_rate)
+d["p_rate_kg_ha"] = d["p_program"].map(estimate_p_rate)
 
-# Tie cost to urea price (urea ~46% N). Baseline at 400 USD/t.
+# --- Apply agronomy levers ---
+n_rate_eff = d["n_rate_kg_ha"] * (0.8 if use_n_inhib else 1.0)
+urea_price_eff = urea_price + (20 if use_n_inhib else 0)         # USD/t
+p_price_eff    = p_price + (20 if use_p_prot else 0)             # €/t
+
+# Cost adjustment for N (assume €≈$ for demo)
 baseline_urea = 400.0
-unit_cost_now = (urea_price / 1000.0) / 0.46          # USD per kg N
+unit_cost_now  = (urea_price_eff / 1000.0) / 0.46      # €/kg N
 unit_cost_base = (baseline_urea / 1000.0) / 0.46
-delta_per_kgN = unit_cost_now - unit_cost_base        # USD per kg N difference vs baseline
-d["cost_adj_eur_ha"] = d["cost_eur_ha"] + d["n_rate_kg_ha"] * delta_per_kgN  # assume €≈$
+delta_per_kgN  = unit_cost_now - unit_cost_base
+cost_n_adj     = n_rate_eff * delta_per_kgN            # €/ha
 
-# Normalize core metrics (with adjusted cost)
-d["yield_norm"] = minmax(d["yield_t_ha"])
+# Cost for P product
+cost_p = d["p_rate_kg_ha"] * (p_price_eff / 1000.0)    # €/ha
+
+# Base cost + N delta + P cost
+d["cost_adj_eur_ha"] = d["cost_eur_ha"] + cost_n_adj + cost_p
+
+# --- Yield & extract effects from P protector ---
+yield_bonus_p = np.where(d["p_rate_kg_ha"] > 0, (0.15 if use_p_prot else 0.0), 0.0)  # t/ha
+d["yield_eff_t_ha"] = d["yield_t_ha"] + yield_bonus_p
+
+# --- Protein adjustments ---
+d["protein_eff"] = d["protein_pct"]
+if use_n_inhib:
+    d["protein_eff"] = d["protein_eff"] - 0.1  # −0.1 pp protein with inhibitor
+
+# Normalize core metrics (with adjusted cost & yield)
+d["yield_norm"] = minmax(d["yield_eff_t_ha"])
 d["cost_norm"]  = 1 - minmax(d["cost_adj_eur_ha"])
 
-# Malting spec band
+# Malting spec band (on effective protein)
 low_ok, high_ok = 10.0, 11.5
 def quality_band(p):
     if low_ok <= p <= high_ok: return "malting"
     if 9.5 <= p < low_ok or high_ok < p <= 12.0: return "edge"
     return "oos"
+d["quality"] = d["protein_eff"].apply(quality_band)
+d["grain_n_pct"] = d["protein_eff"] / 6.25
 
-d["quality"] = d["protein_pct"].apply(quality_band)
-d["grain_n_pct"] = d["protein_pct"] / 6.25
-
+# Price per tonne (malting premium boosted by P protector)
+extra_premium = 4 if use_p_prot else 0
 def price_per_t(row):
-    if row["quality"] == "malting": return base_price + malting_premium
+    if row["quality"] == "malting": return base_price + malting_premium + extra_premium
     if row["quality"] == "oos":     return max(0, base_price - oos_discount)
     return base_price
-
 d["price_eur_t"] = d.apply(price_per_t, axis=1)
 
-# Economics with adjusted cost
-d["revenue_eur_ha"] = d["yield_t_ha"] * d["price_eur_t"]
+# Economics with adjusted cost & yield
+d["revenue_eur_ha"] = d["yield_eff_t_ha"] * d["price_eur_t"]
 d["profit_eur_ha"]  = d["revenue_eur_ha"] - d["cost_adj_eur_ha"]
 d["profit_norm"]    = minmax(d["profit_eur_ha"])
 
-# Quality score (baked in for "Balanced" ranking)
+# Quality score (for Balanced)
 def quality_score(p):
     if low_ok <= p <= high_ok: return 1.0
     if 9.5 <= p < low_ok or high_ok < p <= 12.0: return 0.6
     return 0.15
-d["quality_score"] = d["protein_pct"].apply(quality_score)
+d["quality_score"] = d["protein_eff"].apply(quality_score)
 
-# Hard penalty far out of spec
-hard_penalty = np.where((d["protein_pct"] < 9.5) | (d["protein_pct"] > 12.0), 0.25 * (1 - risk_tolerance), 0.0)
+# Hard penalty far out of spec (reduced if inhibitor on)
+hard_penalty_base = ((d["protein_eff"] < 9.5) | (d["protein_eff"] > 12.0)).astype(float) * 0.25
+hard_penalty = hard_penalty_base * (1 - risk_tolerance) * (0.7 if use_n_inhib else 1.0)
 
-# Extract (starch) proxy
+# Extract (starch) proxy (use effective yield & protein)
 target_protein = 10.5
-dev = (d["protein_pct"] - target_protein).abs()
-dev_scaled = (dev / 1.5).clip(0, 1)     # within ±1.5% best
+dev = (d["protein_eff"] - target_protein).abs()
+dev_scaled = (dev / 1.5).clip(0, 1)
 quality_alignment = 1 - dev_scaled
 extract_raw = d["yield_norm"] * quality_alignment
-d["extract_norm"] = minmax(extract_raw)
+d["extract_norm"] = minmax(extract_raw) + (0.05 if (use_p_prot & (d["p_rate_kg_ha"]>0)).any() else 0.0)
 
-# Small agronomy nudges for extract priority
-p_bonus_flags = d["p_program"].str.contains("starter p", case=False) | d["p_program"].str.contains("soil p adequate", case=False)
+# Agronomy nudges for extract: P good, late N bad (less bad with inhibitor)
+p_bonus_flags = d["p_program"].str.contains("starter p", case=False) | d["p_program"].str.contains("adequate", case=False)
 d["extract_bonus"]   = np.where(p_bonus_flags, 0.05, 0.0)
-d["extract_penalty"] = np.where(d["late_n"] == 1, 0.10 * (1 - risk_tolerance), 0.0)
+late_penalty_scale   = 0.10 * (0.5 if use_n_inhib else 1.0) * (1 - risk_tolerance)
+d["extract_penalty"] = np.where(d["late_n"] == 1, late_penalty_scale, 0.0)
 
-# Composite score (used only for Balanced + tie-breaks)
+# Composite score (Balanced + tie-breaks)
 w_balanced = {"profit": 0.40, "quality": 0.25, "yield": 0.20, "sustain": 0.10, "extract": 0.05}
-wsum = sum(w_balanced.values())
-w_balanced = {k: v/wsum for k, v in w_balanced.items()}
+wsum = sum(w_balanced.values()); w_balanced = {k: v/wsum for k, v in w_balanced.items()}
 d["score"] = (
     w_balanced["profit"]  * d["profit_norm"]   +
     w_balanced["quality"] * d["quality_score"] +
@@ -185,21 +222,23 @@ d["score"] = (
     - hard_penalty
 )
 
-# -------- Priority-driven ranking (CLEAR reordering) --------
+# -------- Priority-driven ranking --------
 if priority == "Maximize profit":
     d["_pri_key"] = d["profit_eur_ha"];     asc = [False]
 elif priority == "Maximize yield":
-    d["_pri_key"] = d["yield_t_ha"];        asc = [False]
+    d["_pri_key"] = d["yield_eff_t_ha"];    asc = [False]
 elif priority == "Lower cost":
     d["_pri_key"] = d["cost_adj_eur_ha"];   asc = [True]
 elif priority == "Higher sustainability":
-    d["_pri_key"] = d["sustain_score"];     asc = [False]
+    # small sustainability bump for inhibitor/protector
+    sustain_adj = d["sustain_score"] + (0.02 if use_n_inhib else 0.0) + (0.01 if use_p_prot else 0.0)
+    d["_pri_key"] = sustain_adj;            asc = [False]
 elif priority.startswith("Maximize extract"):
     d["_pri_key"] = d["extract_norm"] + d["extract_bonus"] - d["extract_penalty"]; asc = [False]
 else:  # Balanced
     d["_pri_key"] = d["score"];             asc = [False]
 
-# Tie-breakers: then by composite score, then by profit
+# Tie-breakers
 sort_cols = ["_pri_key", "score", "profit_eur_ha"]
 asc += [False, False]
 top = d.sort_values(sort_cols, ascending=asc).head(3).reset_index(drop=True)
@@ -212,17 +251,21 @@ def meets_spec_label(pct: float) -> str:
 
 for i, row in top.iterrows():
     st.markdown(f"### Option {i+1}: {row['variety']} — {row['type']} ({row['maturity']})")
-    st.markdown(f"**{meets_spec_label(row['protein_pct'])}**  ·  Grain N: **{row['grain_n_pct']:.2f}%**  ·  P program: **{row['p_program']}**  ·  Late N: **{'Yes' if row['late_n']==1 else 'No'}**")
+    lever_text = []
+    if use_n_inhib: lever_text.append("N inhibitor")
+    if use_p_prot:  lever_text.append("P protector")
+    lever_str = (" · Levers: " + ", ".join(lever_text)) if lever_text else ""
+    st.markdown(f"**{meets_spec_label(row['protein_eff'])}**  ·  Grain N: **{row['grain_n_pct']:.2f}%**  ·  P program: **{row['p_program']}**  ·  Late N: **{'Yes' if row['late_n']==1 else 'No'}**{lever_str}")
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"- **N program:** {row['program_n']}")
         st.markdown(f"- **CP program:** {row['program_cp']}")
-        st.markdown(f"- **Expected yield:** {row['yield_t_ha']:.1f} t/ha")
+        st.markdown(f"- **Expected yield:** {row['yield_eff_t_ha']:.1f} t/ha")
     with col2:
         st.markdown(f"- **Price assumption:** €{row['price_eur_t']:.0f}/t")
         st.markdown(f"- **Revenue:** €{row['revenue_eur_ha']:.0f}/ha")
-        st.markdown(f"- **Cost (adj. for urea):** €{row['cost_adj_eur_ha']:.0f}/ha")
+        st.markdown(f"- **Cost (adj.):** €{row['cost_adj_eur_ha']:.0f}/ha")
 
     st.markdown(f"**Estimated profit:** €{row['profit_eur_ha']:.0f}/ha")
     st.progress(float(row["score"]))
@@ -230,28 +273,24 @@ for i, row in top.iterrows():
 # --- Narrative for Option 1 ---
 if not top.empty:
     best = top.iloc[0]
-    why = ""
+    why = []
+    if use_n_inhib:
+        why.append("N inhibitor on: ~20% lower N use, +€20/t urea; protein slightly reduced (−0.1 pp).")
+    if use_p_prot:
+        why.append("P protector on: +0.15 t/ha with Starter/adequate P and +€4/t premium; +€20/t P cost.")
     if priority == "Maximize profit":
-        why = (f"**Why Option 1?** Highest margin at ~€{best['profit_eur_ha']:.0f}/ha, driven by "
-               f"{best['yield_t_ha']:.1f} t/ha yield and malting acceptance (protein {best['protein_pct']:.1f}%). "
-               f"Even with urea ~{urea_price} USD/t, costs stay competitive. Option 2 trades a little margin for a different risk profile.")
+        why.insert(0, f"Highest margin at ~€{best['profit_eur_ha']:.0f}/ha with malting acceptance (protein {best['protein_eff']:.1f}%).")
     elif priority == "Maximize yield":
-        why = (f"**Why Option 1?** Top yield at {best['yield_t_ha']:.1f} t/ha while staying within/near malting spec "
-               f"(protein {best['protein_pct']:.1f}%). If you want a safer protein buffer, Option 2 is a good trade-off.")
+        why.insert(0, f"Top yield at {best['yield_eff_t_ha']:.1f} t/ha while keeping protein {best['protein_eff']:.1f}% near malting band.")
     elif priority == "Higher sustainability":
-        why = (f"**Why Option 1?** Best sustainability score with a leaner N program and standard CP. "
-               f"Protein {best['protein_pct']:.1f}% remains in the malting band; profit ≈€{best['profit_eur_ha']:.0f}/ha.")
+        why.insert(0, f"Best sustainability profile with leaner inputs; profit ≈€{best['profit_eur_ha']:.0f}/ha.")
     elif priority == "Lower cost":
-        why = (f"**Why Option 1?** Lowest adjusted cost/ha (urea-linked) while keeping malting acceptance "
-               f"(protein {best['protein_pct']:.1f}%). Profit stays competitive; inputs and risk are contained.")
+        why.insert(0, f"Lowest adjusted cost/ha while maintaining malting acceptance (protein {best['protein_eff']:.1f}%).")
     elif priority.startswith("Maximize extract"):
-        why = (f"**Why Option 1?** Grain N ~{best['grain_n_pct']:.2f}% (protein {best['protein_pct']:.1f}%) near "
-               f"the 1.6–1.75% target for extract, with strong yield ({best['yield_t_ha']:.1f} t/ha). "
-               f"{'No late N' if best['late_n']==0 else 'Late N present'}; P program **{best['p_program']}** supports early vigor.")
+        why.insert(0, f"Grain N ~{best['grain_n_pct']:.2f}% (protein {best['protein_eff']:.1f}%), strong yield {best['yield_eff_t_ha']:.1f} t/ha for extract focus.")
     else:
-        why = (f"**Why Option 1?** Best balance of margin (≈€{best['profit_eur_ha']:.0f}/ha), malting acceptance "
-               f"(protein {best['protein_pct']:.1f}%), and operational risk.")
-    st.info(why)
+        why.insert(0, f"Best overall balance of profit (≈€{best['profit_eur_ha']:.0f}/ha), quality, and risk.")
+    st.info(" ".join(why))
 
 # Footers
 st.caption(
@@ -260,7 +299,7 @@ st.caption(
 )
 st.caption(
     "Prices are monthly proxies (FRED barley; World Bank urea) used for defaults. Local/malting spot may differ; "
-    "adjust premiums/discounts as needed. Adjusted cost ties fertilizer cost to urea via estimated kg N from the N program."
+    "adjust premiums/discounts as needed. Costs reflect estimated kg N from the N program and simple P-rate assumptions."
 )
 st.write("---")
 st.write("Built by Nikolay Georgiev — demo to showcase how AI-style logic can simplify farmer choices.")
