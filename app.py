@@ -38,16 +38,21 @@ def fetch_urea_price_usd_t() -> float | None:
         return None
 
 # ================= Helpers =================
-def minmax(x): 
-    return (x - x.min()) / (x.max() - x.max() + 1e-9) if len(x) else x
+def minmax(series: pd.Series) -> pd.Series:
+    if series.size == 0:
+        return series
+    mn, mx = series.min(), series.max()
+    return (series - mn) / (mx - mn + 1e-9)
 
 def extract_n_rate(s: str) -> float:
+    """Parse '... (60 kg N, ...)' -> 60."""
     if not isinstance(s, str):
         return 0.0
     m = re.search(r"(\d+)\s*kg\s*N", s)
     return float(m.group(1)) if m else 0.0
 
 def estimate_p_rate(program: str) -> float:
+    """Crude P product rate proxy (kg/ha) by program text."""
     prog = (program or "").lower()
     if "starter" in prog:  return 25.0
     if "adequate" in prog: return 10.0
@@ -75,6 +80,7 @@ def cp_cost_bump(level: str) -> float:
 DATA_PATH = Path("data/barley_scenarios.csv")
 df = pd.read_csv(DATA_PATH, sep=",", engine="c", encoding="utf-8", skip_blank_lines=True)
 df.columns = [c.strip().lower() for c in df.columns]
+
 required = ["region","crop","variety","type","maturity","program_n","program_cp",
             "yield_t_ha","cost_eur_ha","protein_pct","sustain_score","p_program","late_n"]
 missing = [c for c in required if c not in df.columns]
@@ -118,9 +124,9 @@ if mode.startswith("Advisor"):
     st.subheader("Agronomy levers")
     a1,a2 = st.columns(2)
     with a1:
-        use_n_inhib = st.checkbox("Use N inhibitor (↓20% N, +€20/t urea, −0.1 pp protein)")
+        use_n_inhib = st.checkbox("Use N inhibitor (↓20% N, +€20/t urea, −0.1 pp protein)", value=False)
     with a2:
-        use_p_prot  = st.checkbox("Use P protector (+0.15 t/ha with Starter/adequate P, +€20/t P, +€4/t premium)")
+        use_p_prot  = st.checkbox("Use P protector (+0.15 t/ha with Starter/adequate P, +€20/t P, +€4/t premium)", value=False)
 
 with st.expander("Price sources (proxies)", expanded=False):
     st.caption("Barley: FRED global barley price (PBARLUSDM), monthly proxy. Adjust malting premium for region/spec.")
@@ -143,48 +149,47 @@ d0["p_rate_kg_ha"] = d0["p_program"].map(estimate_p_rate)
 # ================= Core physics (single-candidate calc) =================
 def evaluate_candidate(row, dN=0, cp_level="standard", lateN=None, use_inhib=False, use_pprot=False):
     """
-    Returns a dict with effective yield/protein/cost/sustainability/prices/profit etc.
+    Evaluate one candidate (variety + lever settings). Returns dict with effective metrics and levers.
     """
     # Base values
     y0 = row["yield_t_ha"]
     prot0 = row["protein_pct"]
-    n_base = row["n_rate_kg_ha"]
-    p_rate = row["p_rate_kg_ha"]
-    sustain0 = row["sustain_score"]
+    n_base = float(row["n_rate_kg_ha"])
+    p_rate = float(row["p_rate_kg_ha"])
+    sustain0 = float(row["sustain_score"])
     late_base = int(row["late_n"])
-    # Decide lateN default if not provided
     lateN = late_base if lateN is None else int(lateN)
 
-    # Effective N
-    n_target = max(0.0, n_base + dN)
+    # Effective N (base + delta, then inhibitor efficiency)
+    n_target = max(0.0, n_base + float(dN))
     n_eff = n_target * (0.8 if use_inhib else 1.0)
-    # Urea €/kg N (assume €≈$)
-    urea_eff = urea_price + (20 if use_inhib else 0)
-    unit_cost_now  = (urea_eff / 1000.0) / 0.46
-    unit_cost_base = (400.0 / 1000.0) / 0.46
-    costN = (n_eff - n_base) * unit_cost_now + n_base * (unit_cost_now - unit_cost_base)  # delta vs baseline + repricing
+
+    # Fertilizer costs (assume €≈$ for demo)
+    urea_eff = urea_price + (20 if use_inhib else 0)  # USD/t
+    unit_cost_now  = (urea_eff / 1000.0) / 0.46       # €/kg N
+    unit_cost_base = (400.0   / 1000.0) / 0.46
+    # Reprice base N at today's price + add/less for ΔN
+    costN = n_eff * unit_cost_now - n_base * unit_cost_base
 
     # CP cost bump
     costCP = cp_cost_bump(cp_level)
-    # P cost
-    p_price_eff = p_price + (20 if use_pprot else 0)
+
+    # P product cost
+    p_price_eff = p_price + (20 if use_pprot else 0)  # €/t
     costP = p_rate * (p_price_eff / 1000.0)
 
     # Yield response
     alpha = 0.6  # magnitude of N response (demo)
-    if n_base > 0:
-        dY_N = alpha * (np.sqrt(max(0.1, n_eff) / n_base) - 1.0)
-    else:
-        dY_N = 0.0
+    dY_N = alpha * (np.sqrt(max(0.1, n_eff) / max(0.1, n_base)) - 1.0) if n_base > 0 else 0.0
     dY_CP = cp_yield_bump(cp_level)
     dY_P  = (0.15 if (use_pprot and p_rate > 0) else 0.0)
     y_eff = max(0.1, y0 + dY_N + dY_CP + dY_P)
 
     # Protein response
     beta1, beta2, beta3 = 0.30, 0.40, 0.20
-    dProt_N = beta1 * np.log(max(0.1, n_eff) / max(0.1, n_base)) if n_base > 0 else 0.0
+    dProt_N    = beta1 * np.log(max(0.1, n_eff) / max(0.1, n_base)) if n_base > 0 else 0.0
     dProt_late = (beta2 * (0.5 if use_inhib else 1.0)) if lateN == 1 else 0.0
-    dProt_dil = -beta3 * (y_eff - y0)
+    dProt_dil  = -beta3 * (y_eff - y0)
     prot_eff = prot0 + dProt_N + dProt_late + dProt_dil + (-0.1 if use_inhib else 0.0)
 
     # Quality & price
@@ -192,7 +197,7 @@ def evaluate_candidate(row, dN=0, cp_level="standard", lateN=None, use_inhib=Fal
     extra_prem = 4 if (use_pprot and p_rate > 0) else 0
     price_t = calc_price_per_t(q, base_price, malting_premium, oos_discount, extra_prem)
 
-    # Sustainability (simple proxy)
+    # Sustainability (proxy)
     sustain = sustain0 \
         - 0.002*(n_eff - n_base) \
         - (0.00 if cp_level=="minimal" else (0.03 if cp_level=="standard" else 0.07)) \
@@ -201,14 +206,14 @@ def evaluate_candidate(row, dN=0, cp_level="standard", lateN=None, use_inhib=Fal
     sustain = float(np.clip(sustain, 0.0, 1.0))
 
     # Economics
-    cost_adj = row["cost_eur_ha"] + costN + costCP + costP
+    cost_adj = float(row["cost_eur_ha"]) + costN + costCP + costP
     revenue = y_eff * price_t
     profit  = revenue - cost_adj
 
     # Extract proxy
     target_prot = 10.5
     align = 1.0 - np.clip(abs(prot_eff - target_prot)/1.5, 0, 1)
-    extract_score = align * (y_eff / (y0 + 1e-9))  # normalized to variety baseline
+    extract_score = align * (y_eff / (y0 + 1e-9))  # relative to baseline
 
     return {
         "yield": y_eff,
@@ -221,6 +226,8 @@ def evaluate_candidate(row, dN=0, cp_level="standard", lateN=None, use_inhib=Fal
         "profit": profit,
         "sustain": sustain,
         "extract_score": extract_score,
+        "n_base": n_base,
+        "n_eff": n_eff,
         "levers": {
             "ΔN": int(dN),
             "CP": cp_level,
@@ -230,51 +237,37 @@ def evaluate_candidate(row, dN=0, cp_level="standard", lateN=None, use_inhib=Fal
         }
     }
 
-# ================= Advisor mode =================
-def run_advisor(d):
-    # Use user toggles
-    use_n_inhib = st.session_state.get("_use_n_inhib", False)
-    use_p_prot  = st.session_state.get("_use_p_prot", False)
-
-    # if they exist in session (set below), use them; else build now from UI
-    # (when mode switches back we re-render UI and set them again)
-    # Recreate UI toggles to keep behavior identical
-    pass
-
-# Build cache of advisor toggles from current UI state
-if mode.startswith("Advisor"):
-    # cache in session to reuse in run
-    st.session_state["_use_n_inhib"] = st.checkbox("Use N inhibitor (↓20% N, +€20/t urea, −0.1 pp protein)", value=False, key="advisor_inhib")
-    st.session_state["_use_p_prot"]  = st.checkbox("Use P protector (+0.15 t/ha with Starter/adequate P, +€20/t P, +€4/t premium)", value=False, key="advisor_pprot")
-    st.write("---")
-
-# Compute and rank for either mode
+# ================= Build candidates (Advisor vs Optimizer) =================
 candidates = []
 
 if mode.startswith("Advisor"):
-    # Advisor: evaluate each base row as a single candidate with the chosen toggles and *no* ΔN/CP changes
+    # Use user toggles; do NOT change ΔN or CP from base
     for _, row in d0.iterrows():
+        cp_level = "standard" if "standard" in row["program_cp"].lower() else \
+                   ("minimal" if "minimal" in row["program_cp"].lower() else "intensive")
         res = evaluate_candidate(
             row,
             dN=0,
-            cp_level="standard" if "standard" in row["program_cp"].lower() else
-                     ("minimal" if "minimal" in row["program_cp"].lower() else "intensive"),
+            cp_level=cp_level,
             lateN=row["late_n"],
-            use_inhib=st.session_state["_use_n_inhib"],
-            use_pprot=st.session_state["_use_p_prot"]
+            use_inhib=use_n_inhib,
+            use_pprot=use_p_prot
         )
-        res.update({"variety": row["variety"], "type": row["type"], "maturity": row["maturity"], "p_program": row["p_program"], "program_n": row["program_n"], "program_cp": row["program_cp"]})
+        res.update({
+            "variety": row["variety"], "type": row["type"], "maturity": row["maturity"],
+            "p_program": row["p_program"], "program_n": row["program_n"], "program_cp": row["program_cp"]
+        })
         candidates.append(res)
 
 else:
-    # Optimizer: try small grid around each row
+    # Optimizer: small grid search around each row
     dN_grid = [-20, 0, +20, +30]
     cp_grid = ["minimal", "standard", "intensive"]
-    late_grid = [0, 1]  # we'll keep risk_tolerance in the penalty later
+    late_grid = [0, 1]
     inhib_grid = [False, True]
-    # Protector only matters if there is some P in the base program
+
     for _, row in d0.iterrows():
-        allow_pp = True if row["p_rate_kg_ha"] > 0 else False
+        allow_pp = (row["p_rate_kg_ha"] > 0)
         pprot_grid = [False, True] if allow_pp else [False]
         for dN in dN_grid:
             for cp in cp_grid:
@@ -282,23 +275,28 @@ else:
                     for inhib in inhib_grid:
                         for pprot in pprot_grid:
                             res = evaluate_candidate(row, dN=dN, cp_level=cp, lateN=late, use_inhib=inhib, use_pprot=pprot)
-                            # Apply risk penalty far from malting band (reduced by risk_tolerance)
+                            # Risk penalty far outside malting band (dampened by risk tolerance)
                             penalty = 0.0
                             if res["protein"] < 9.5 or res["protein"] > 12.0:
-                                penalty = 9999 * (1 - risk_tolerance)  # effectively discard at low risk tolerance
-                            score_bal = 0.40*(res["profit"]) + 0.25*(1.0 if res["quality"]=="malting" else 0.6 if res["quality"]=="edge" else 0.15) \
-                                        + 0.20*(res["yield"]) + 0.10*(res["sustain"]) + 0.05*(res["extract_score"])
+                                penalty = 9999 * (1 - risk_tolerance)  # basically exclude at low risk tolerance
+                            # Balanced composite (for balanced ranking & tie-breaks)
+                            score_bal = 0.40*(res["profit"]) + \
+                                        0.25*(1.0 if res["quality"]=="malting" else 0.6 if res["quality"]=="edge" else 0.15) + \
+                                        0.20*(res["yield"]) + 0.10*(res["sustain"]) + 0.05*(res["extract_score"])
                             res.update({"_penalty": penalty, "_score_bal": score_bal})
-                            res.update({"variety": row["variety"], "type": row["type"], "maturity": row["maturity"], "p_program": row["p_program"], "program_n": row["program_n"], "program_cp": row["program_cp"]})
+                            res.update({
+                                "variety": row["variety"], "type": row["type"], "maturity": row["maturity"],
+                                "p_program": row["p_program"], "program_n": row["program_n"], "program_cp": row["program_cp"]
+                            })
                             candidates.append(res)
 
-# Convert to DataFrame for ranking
+# ================= Ranking =================
 dd = pd.DataFrame(candidates)
 if dd.empty:
     st.warning("No candidates found.")
     st.stop()
 
-# Priority-driven ranking key
+# Priority-driven primary sort key
 if priority == "Maximize profit":
     dd["_pri_key"] = dd["profit"];     asc = [False]
 elif priority == "Maximize yield":
@@ -309,10 +307,10 @@ elif priority == "Higher sustainability":
     dd["_pri_key"] = dd["sustain"];    asc = [False]
 elif priority.startswith("Maximize extract"):
     dd["_pri_key"] = dd["extract_score"]; asc = [False]
-else:
+else:  # Balanced
     dd["_pri_key"] = dd["_score_bal"] if "_score_bal" in dd else dd["profit"]; asc = [False]
 
-# Apply risk penalty (optimizer mode)
+# Apply risk penalty in optimizer
 if "_penalty" in dd:
     dd["_pri_key"] = dd["_pri_key"] - dd["_penalty"]
 
@@ -335,18 +333,30 @@ for i, row in top.iterrows():
     c1,c2 = st.columns(2)
     with c1:
         st.markdown(f"- **N program (base):** {row['program_n']}")
+        # Show N base → effective (Advisor) or effective with base (Optimizer)
+        if mode.startswith("Advisor"):
+            # In Advisor, only inhibitor can change N rate
+            if "N inhibitor" in row["levers"] and row["levers"]["N inhibitor"] == "On":
+                st.markdown(f"- **N rate:** {row['n_base']:.0f} → **{row['n_eff']:.0f} kg N/ha** (inhibitor −20%)")
+            else:
+                st.markdown(f"- **N rate:** {row['n_base']:.0f} kg N/ha")
+        else:
+            st.markdown(f"- **N rate (effective):** {row['n_eff']:.0f} kg N/ha (base {row['n_base']:.0f})")
+
         st.markdown(f"- **CP program (base):** {row['program_cp']}")
         st.markdown(f"- **Expected yield:** {row['yield']:.1f} t/ha")
+
     with c2:
         st.markdown(f"- **Price assumption:** €{row['price_eur_t']:.0f}/t")
         st.markdown(f"- **Revenue:** €{row['revenue']:.0f}/ha")
         st.markdown(f"- **Cost (adj.):** €{row['cost_adj']:.0f}/ha")
 
     st.markdown(f"**Estimated profit:** €{row['profit']:.0f}/ha")
-    # Progress bar based on normalized _pri_key (display-only)
+
+    # Display-only progress based on normalized _pri_key within the top-3
     bar_norm = 0.5
-    if len(top)>1:
-        keyvals = top["_pri_key"].fillna(0).values.astype(float)
+    if len(top) > 1:
+        keyvals = top["_pri_key"].fillna(0).to_numpy(dtype=float)
         bar_norm = float((keyvals[i]-keyvals.min())/(keyvals.max()-keyvals.min()+1e-9))
     st.progress(bar_norm)
 
